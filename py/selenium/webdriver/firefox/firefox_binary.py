@@ -18,7 +18,7 @@
 
 import os
 import platform
-from subprocess import Popen, STDOUT
+from subprocess import Popen, STDOUT, call
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common import utils
 import time
@@ -73,6 +73,18 @@ class FirefoxBinary(object):
         This is useful when the browser is stuck.
         """
         if self.process:
+            if os.name == 'nt':
+                # Windows platform. Terminates the process tree using
+                # taskkill as kill doesn't terminate the plugin-container
+                # process and leads to a crash dialog box.
+                command = ("taskkill", "/f", "/t", "/pid", str(self.process.pid))
+                try:
+                    call(command, stdout=self._log_file, stderr=STDOUT)
+                    self.process.wait()
+                    return
+                except WindowsError:
+                    pass
+
             self.process.kill()
             self.process.wait()
 
