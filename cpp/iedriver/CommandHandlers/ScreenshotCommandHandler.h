@@ -20,6 +20,7 @@
 #include "../Browser.h"
 #include "../IECommandHandler.h"
 #include "../IECommandExecutor.h"
+#include "../ScreenshotUtilities.h"
 #include "logging.h"
 #include <atlimage.h>
 #include <atlenc.h>
@@ -48,34 +49,27 @@ class ScreenshotCommandHandler : public IECommandHandler {
       return;
     }
 
-    bool isSameColour = true;
     HRESULT hr;
-    int i = 0;
-    int tries = 4;
-    do {
+
+    // Capture the view
+    int tries = 2;
+    for (int i = 1; ; i++) {
+      hr = this->CaptureBrowser(browser_wrapper);
+      if (SUCCEEDED(hr))
+        break;
+
+      LOGHR(WARN, hr) << "Failed to capture browser image at " << i << " try";
       this->ClearImage();
 
-      this->image_ = new CImage();
-      hr = this->CaptureBrowser(browser_wrapper);
-      if (FAILED(hr)) {
-        LOGHR(WARN, hr) << "Failed to capture browser image at " << i << " try";
-        this->ClearImage();
+      if (i >= tries) {
         response->SetSuccessResponse("");
         return;
       }
+    }
 
-      isSameColour = IsSameColour();
-      if (isSameColour) {
-        ::Sleep(2000);
-        LOG(DEBUG) << "Failed to capture non single color browser image at " << i << " try";
-      }
-
-      i++;
-    } while ((i < tries) && isSameColour);
-
-    // now either correct or single color image is got
+    // Convert to a base64 string
     std::string base64_screenshot = "";
-    hr = this->GetBase64Data(base64_screenshot);
+    hr = ConvImageToPngBase64string(this->image_, base64_screenshot);
     if (FAILED(hr)) {
       LOGHR(WARN, hr) << "Unable to transform browser image to Base64 format";
       this->ClearImage();
@@ -100,269 +94,281 @@ class ScreenshotCommandHandler : public IECommandHandler {
   HRESULT CaptureBrowser(BrowserHandle browser) {
     LOG(TRACE) << "Entering ScreenshotCommandHandler::CaptureBrowser";
 
+    // Get ie window and content view handles
     HWND ie_window_handle = browser->GetTopLevelWindowHandle();
     HWND content_window_handle = browser->GetContentWindowHandle();
-
-    CComPtr<IHTMLDocument2> document;
-    browser->GetDocument(true, &document);
-    if (!document) {
-      LOG(WARN) << "Unable to get document from browser. Are you viewing a non-HTML document?";
-      return E_ABORT;
-    }
-
-    LocationInfo document_info;
-    bool result = DocumentHost::GetDocumentDimensions(document, &document_info);
-    if (!result) {
-      LOG(DEBUG) << "Unable to get document dimensions";
+    if (ie_window_handle == 0 || content_window_handle == 0)
       return E_FAIL;
-    }
-    LOG(DEBUG) << "Initial document sizes (scrollWidth, scrollHeight) are (w, h): "
-               << document_info.width << ", " << document_info.height;
 
-    int chrome_width(0);
-    int chrome_height(0);
-    this->GetBrowserChromeDimensions(ie_window_handle,
-                                     content_window_handle,
-                                     &chrome_width,
-                                     &chrome_height);
-    LOG(DEBUG) << "Initial chrome sizes are (w, h): "
-               << chrome_width << ", " << chrome_height;
+    // Get document IHTMLDocument2 and IHTMLDocument3 interfaces
+    CComPtr<IHTMLDocument2> document2;
+    CComPtr<IHTMLDocument3> document3;
+    if (!GetDocument(browser, &document2, &document3))
+      return E_FAIL;
 
-    int target_window_width = document_info.width + chrome_width;
-    int target_window_height = document_info.height + chrome_height;
+    // Get canvas IHTMLElement and IHTMLElement2 interfaces
+    CComPtr<IHTMLElement> canvas;
+    CComPtr<IHTMLElement2> canvas2;
+    if (!GetCanvas(document2, document3, &canvas, &canvas2))
+      return E_FAIL;
 
-    // For some reason, this technique does not allow the user to resize
-    // the browser window to greater than SIZE_LIMIT x SIZE_LIMIT. This is
-    // pretty big, so we'll cap the allowable screenshot size to that.
-    //
-    // GDI+ limit after which it may report Generic error for some image types
-    int SIZE_LIMIT = 65534; 
-    if (target_window_height > SIZE_LIMIT) {
-      LOG(WARN) << "Required height is greater than limit. Truncating screenshot height.";
-      target_window_height = SIZE_LIMIT;
-      document_info.height = target_window_height - chrome_height;
-    }
-    if (target_window_width > SIZE_LIMIT) {
-      LOG(WARN) << "Required width is greater than limit. Truncating screenshot width.";
-      target_window_width = SIZE_LIMIT;
-      document_info.width = target_window_width - chrome_width;
-    }
+    // Get the top window dimensions (outerWidth/outerHeight)
+    int windowWidth(0), windowHeight(0);
+    if (!GetWindowSize(ie_window_handle, &windowWidth, &windowHeight))
+      return E_FAIL;
+    LOG(DEBUG) << "Initial window size (w, h): " << windowWidth << ", " << windowHeight;
 
-    long original_width = browser->GetWidth();
-    long original_height = browser->GetHeight();
-    LOG(DEBUG) << "Initial browser window sizes are (w, h): "
-               << original_width << ", " << original_height;
+    // Get the view dimensions (innerWidth/innerHeight)
+    int viewWidth(0), viewHeight(0);
+    if (!GetWindowSize(content_window_handle, &viewWidth, &viewHeight))
+      return E_FAIL;
+    LOG(DEBUG) << "Initial view size (w, h): " << viewWidth << ", " << viewHeight;
 
-    // If the window is already wide enough to accomodate
-    // the document, don't resize that dimension. Otherwise,
-    // the window will display a horizontal scroll bar, and
-    // we need to retain the scrollbar to avoid rerendering
-    // during the resize, so reduce the target window width
-    // by two pixels.
-    if (original_width > target_window_width) {
-      target_window_width = original_width;
-    } else {
-      target_window_width -= 2;
-    }
-
-    // If the window is already tall enough to accomodate
-    // the document, don't resize that dimension. Otherwise,
-    // the window will display a vertical scroll bar, and
-    // we need to retain the scrollbar to avoid rerendering
-    // during the resize, so reduce the target window height
-    // by two pixels.
-    if (original_height > target_window_height) {
-      target_window_height = original_height;
-    } else {
-      target_window_height -= 2;
-    }
-
+    // The resize message is being ignored if the window appears to be
+    // maximized.  There's likely a way to bypass that. The kludgy way
+    // is to unmaximize the window, then move on with setting the window
+    // to the dimensions we really want.  This is okay because we revert
+    // back to the original dimensions afterward.
     BOOL is_maximized = ::IsZoomed(ie_window_handle);
-    bool requires_resize = original_width < target_window_width ||
-                           original_height < target_window_height;
 
-    if (requires_resize) {
-      // The resize message is being ignored if the window appears to be
-      // maximized.  There's likely a way to bypass that. The kludgy way 
-      // is to unmaximize the window, then move on with setting the window
-      // to the dimensions we really want.  This is okay because we revert
-      // back to the original dimensions afterward.
-      if (is_maximized) {
-        LOG(DEBUG) << "Window is maximized currently. Demaximizing.";
-        ::ShowWindow(ie_window_handle, SW_SHOWNORMAL);
+    // GDI+ limit after which it may report Generic error for some image types
+    int SIZE_LIMIT = 65534;
+
+    HRESULT hr;
+    bool is_resized_width = false;
+    bool is_resized_height = false;
+    long targetWindowWidth = windowWidth;
+    long targetWindowHeight = windowHeight;
+
+    // Get metrics related to the width (clientWidth, scrollWidth, scrollbarWidth)
+    long clientWidth(0);
+    canvas2->get_clientWidth(&clientWidth);
+    long scrollWidth(0);
+    canvas2->get_scrollWidth(&scrollWidth);
+    int scrollbarWidth = max(0, viewWidth - clientWidth);
+    LOG(DEBUG) << "Initial"
+      << " clientWidth=" << clientWidth
+      << " scrollWidth=" << scrollWidth
+      << " scrollbarWidth=" << scrollbarWidth;
+
+    // Increase the window width if necessary.
+    int targetViewWidth = max(viewWidth, scrollWidth + scrollbarWidth);
+    if (targetViewWidth > viewWidth) {
+      if (targetViewWidth  > SIZE_LIMIT) {
+        LOG(WARN) << "Required width is greater than limit. Truncating screenshot width.";
+        targetViewWidth = SIZE_LIMIT;
       }
 
-      // NOTE: There is a *very* slight chance that resizing the window
-      // so there are no longer scroll bars to be displayed *might* cause
-      // layout redraws such that the screenshot does not show the entire
-      // DOM after the resize. Since we should always be expanding the
-      // window size, never contracting it, this is a corner case that
-      // explicitly will *not* be fixed. Any issue reports describing this
-      // corner case will be closed without action.
-      RECT ie_window_rect;
-      ::GetWindowRect(ie_window_handle, &ie_window_rect);
-      ::SetWindowPos(ie_window_handle,
-                     NULL, 
-                     ie_window_rect.left,
-                     ie_window_rect.top,
-                     target_window_width,
-                     target_window_height,
-                     SWP_NOSENDCHANGING);
+      if (is_maximized) {
+        LOG(DEBUG) << "Window is maximized currently. Demaximizing.";
+        ::ShowWindow(ie_window_handle, SW_SHOWNOACTIVATE);
+      }
+
+      targetWindowWidth += (targetViewWidth - viewWidth);
+      LOG(DEBUG) << "Increasing window width by " << targetWindowWidth << "px";
+      SetWindowSize(ie_window_handle, targetWindowWidth, targetWindowHeight);
+
+      is_resized_width = true;
     }
 
-    // Capture the window's canvas to a DIB.
-    // If there are any scroll bars in the window, they should
-    // be explicitly cropped out of the image, because of the
-    // size of image we are creating..
-    BOOL created = this->image_->Create(document_info.width,
-                                        document_info.height,
-                                        /*numbers of bits per pixel = */ 32);
-    if (!created) {
-      LOG(WARN) << "Unable to initialize image object";
-    }
-    HDC device_context_handle = this->image_->GetDC();
+    // Get metrics related to the height (clientHeight, scrollHeight, scrollbarHeight)
+    long clientHeight(0);
+    canvas2->get_clientHeight(&clientHeight);
+    long scrollHeight(0);
+    canvas2->get_scrollHeight(&scrollHeight);
+    int scrollbarHeight = max(0, viewHeight - clientHeight);
+    LOG(DEBUG) << "Initial"
+      << " clientHeight=" << clientHeight
+      << " scrollHeight=" << scrollHeight
+      << " scrollbarHeight=" << scrollbarHeight;
 
-    BOOL print_result = ::PrintWindow(content_window_handle,
-                                      device_context_handle,
-                                      PW_CLIENTONLY);
-    if (!print_result) {
-      LOG(WARN) << "PrintWindow API is not able to get content window screenshot";
+    // Increase the window height if necessary.
+    int targetViewHeight = max(viewHeight, scrollHeight + scrollbarHeight);
+    if (targetViewHeight > viewHeight) {
+      if (targetViewHeight > SIZE_LIMIT) {
+        LOG(WARN) << "Required height is greater than limit. Truncating screenshot height.";
+        targetViewHeight = SIZE_LIMIT;
+      }
+
+      if (is_maximized && !is_resized_width) {
+        LOG(DEBUG) << "Window is maximized currently. Demaximizing.";
+        ::ShowWindow(ie_window_handle, SW_SHOWNOACTIVATE);
+      }
+
+      if (scrollbarWidth > 0) {
+        // Force the vertical scrollbar by removing 2 pixels so it
+        // doesn't disappear once resized.
+        targetViewHeight -= 2;
+        LOG(DEBUG) << "Removed 2px to the targeted height to force the vertical scrollbar.";
+      }
+
+      targetWindowHeight += (targetViewHeight - viewHeight);
+      LOG(DEBUG) << "Increasing window height by " << targetWindowHeight << "px";
+      SetWindowSize(ie_window_handle, targetWindowWidth, targetWindowHeight);
+
+      is_resized_height = true;
     }
 
-    if (requires_resize) {
+    // Get the final client size.
+    long targetClientWidth = clientWidth;
+    long targetClientHeight = clientHeight;
+    if (is_resized_width || is_resized_height) {
+      // In some rare cases, the client size is not yet updated.
+      // If it's the case, we force the reclac and retry.
+      for (int i = 0; i < 2; i++) {
+        canvas2->get_clientWidth(&targetClientWidth);
+        canvas2->get_clientHeight(&targetClientHeight);
+
+        // Check that the target client width/height has been updated.
+        bool calcWidthOK = !is_resized_width || targetClientWidth != clientWidth;
+        bool calcHeightOK = !is_resized_height || targetClientHeight != clientHeight;
+        if (calcWidthOK && calcHeightOK)
+          break;
+
+        LOG(DEBUG) << "Failed to update the client size at try " << i;
+
+        // recalc document
+        bool fForce = i > 0;
+        document3->recalc(fForce);
+      }
+    }
+
+    // Ensure that the client area has at least 1 pixel.
+    // If it's not the case, we take the view size as target instead.
+    if (targetClientWidth < 1 || targetClientHeight < 1) {
+      LOG(WARN) << "Target client size is null. Take the view size instead.";
+      targetClientWidth = targetViewWidth;
+      targetClientHeight = targetViewHeight;
+    }
+
+    LOG(DEBUG) << "Final client size: " << targetClientWidth << " x " << targetClientHeight;
+    LOG(DEBUG) << "Final view size: " << targetViewWidth << " x " << targetViewHeight;
+    LOG(DEBUG) << "Final window size: " << targetWindowWidth << " x " << targetWindowHeight;
+
+    // Capture the view
+    this->image_ = CaptureView(content_window_handle,
+                               targetClientWidth,
+                               targetClientHeight,
+                               clientWidth - 17,
+                               clientHeight - 17);
+
+    if (is_resized_width || is_resized_height) {
       // Restore the browser to the original dimensions.
       if (is_maximized) {
         ::ShowWindow(ie_window_handle, SW_MAXIMIZE);
       } else {
-        browser->SetHeight(original_height);
-        browser->SetWidth(original_width);
+        SetWindowSize(ie_window_handle, windowWidth, windowHeight);
       }
     }
 
-    this->image_->ReleaseDC();
-    return S_OK;
+    return this->image_ == NULL ? E_FAIL : S_OK;
   }
 
-  bool IsSameColour() {
-    COLORREF firstPixelColour = this->image_->GetPixel(0, 0);
 
-    for (int i = 0; i < this->image_->GetWidth(); i++) {
-      for (int j = 0; j < this->image_->GetHeight(); j++) {
-        if (firstPixelColour != this->image_->GetPixel(i, j)) {
-          return false;
-        }
+  /// <summary>
+  /// Capture the view window (Internet Explorer_Server) using the PrintWindow API.
+  /// Returns a CImage pointer if succeed, NULL otherwise.
+  /// </summary>
+  CImage* CaptureView(const HWND view_handle, int width, int height
+    , int check_width, int check_height) {
+
+    // Create the bitmap (32bits per pixel) and get the device context.
+    CImage* image = new CImage();
+    if (!image->Create(width, height, 32, 0)) {
+      LOG(WARN) << "Unable to initialize image object";
+      return NULL;
+    }
+    HDC device_context_handle = image->GetDC();
+
+    // Enter a try loop to capture the view (3 tries). The capture is considered a
+    // success if within the check size, at least one pixel is different.
+    for (int i = 1; i <= 3; i++) {
+
+      bool is_print_success = ::PrintWindow(view_handle, device_context_handle, 0);
+      if (!is_print_success) {
+        LOG(WARN) << "PrintWindow API failed at try " << i;
+        ::UpdateWindow(view_handle);
+        continue;
       }
+
+      bool is_same_color = IsImageSameColour(image, check_width, check_height);
+      if (is_same_color) {
+        LOG(DEBUG) << "Failed to capture non single colour browser image at try " << i;
+        ::UpdateWindow(view_handle);
+        continue;
+      }
+
+      break;
+    }
+
+    // Release the device context and return the image.
+    image->ReleaseDC();
+    return image;
+  }
+
+
+  /// <summary>
+  /// Get the document IHTMLDocument2 and IHTMLDocument3 interfaces from the browser.
+  /// Return true if succeed, false otherwise.
+  /// </summary>
+  static bool GetDocument(BrowserHandle browser, IHTMLDocument2** document2
+    , IHTMLDocument3** document3) {
+
+    // Get document IHTMLDocument2 interface from browser
+    browser->GetDocument(true, document2);
+    if (!document2) {
+      LOG(WARN) << "Unable to get document from browser. Are you viewing a non-HTML document?";
+      return false;
+    }
+
+    // Get document IHTMLDocument3 interface
+    HRESULT hr = (*document2)->QueryInterface<IHTMLDocument3>(document3);
+    if (FAILED(hr)) {
+      LOGHR(WARN, hr) << "Unable to get IHTMLDocument3 interface from document.";
+      return false;
     }
 
     return true;
   }
 
-  HRESULT GetBase64Data(std::string& data) {
-    LOG(TRACE) << "Entering ScreenshotCommandHandler::GetBase64Data";
 
-    if (this->image_ == NULL) {
-      LOG(DEBUG) << "CImage was not initialized.";
-      return E_POINTER;
+  /// <summary>
+  /// Get the canvas which is the body if the document is in compatible mode or
+  /// the documentElement otherwise.
+  /// Return true if succeed, false otherwise.
+  /// </summary>
+  static bool GetCanvas(IHTMLDocument2* document2, IHTMLDocument3* document3
+    , IHTMLElement** canvas, IHTMLElement2** canvas2) {
+
+    HRESULT hr;
+
+    bool isStandardMode = DocumentHost::IsStandardsMode(document2);
+    if (isStandardMode) {
+      // Canvas is documentElement
+      hr = document3->get_documentElement(canvas);
+      if (FAILED(hr)) {
+        LOGHR(WARN, hr) << "Unable to get documentElement from document.";
+        return false;
+      }
+    } else {
+      // Canvas is body
+      hr = document2->get_body(canvas);
+      if (FAILED(hr)) {
+        LOGHR(WARN, hr) << "Unable to get body from document.";
+        return false;
+      }
     }
 
-    CComPtr<IStream> stream;
-    HRESULT hr = ::CreateStreamOnHGlobal(NULL, TRUE, &stream);
+    // Get canvas IHTMLElement2 interface
+    hr = (*canvas)->QueryInterface<IHTMLElement2>(canvas2);
     if (FAILED(hr)) {
-      LOGHR(WARN, hr) << "Error is occured during creating IStream";
-      return hr;
+      LOGHR(WARN, hr) << "Unable to get IHTMLElement2 interface from canvas.";
+      return false;
     }
 
-    GUID image_format = Gdiplus::ImageFormatPNG /*Gdiplus::ImageFormatJPEG*/;
-    hr = this->image_->Save(stream, image_format);
-    if (FAILED(hr)) {
-      LOGHR(WARN, hr) << "Saving screenshot image is failed";
-      return hr;
-    }
-
-    // Get the size of the stream.
-    STATSTG statstg;
-    hr = stream->Stat(&statstg, STATFLAG_DEFAULT);
-    if (FAILED(hr)) {
-      LOGHR(WARN, hr) << "No stat on stream is got";
-      return hr;
-    }
-
-    HGLOBAL global_memory_handle = NULL;
-    hr = ::GetHGlobalFromStream(stream, &global_memory_handle);
-    if (FAILED(hr)) {
-      LOGHR(WARN, hr) << "No HGlobal in stream";
-      return hr;
-    }
-
-    // TODO: What if the file is bigger than max_int?
-    int stream_size = static_cast<int>(statstg.cbSize.QuadPart);
-    LOG(DEBUG) << "Size of screenshot image stream is " << stream_size;
-
-    int length = ::Base64EncodeGetRequiredLength(stream_size, ATL_BASE64_FLAG_NOCRLF);
-    if (length <= 0) {
-      LOG(WARN) << "Got zero or negative length from base64 required length";
-      return E_FAIL;
-    }
-
-    BYTE* global_lock = reinterpret_cast<BYTE*>(::GlobalLock(global_memory_handle));
-    if (global_lock == NULL) {
-      LOGERR(WARN) << "Unable to lock memory for base64 encoding";
-      ::GlobalUnlock(global_memory_handle);      
-      return E_FAIL;
-    }
-
-    char* data_array = new char[length + 1];
-    if (!::Base64Encode(global_lock,
-                        stream_size,
-                        data_array,
-                        &length,
-                        ATL_BASE64_FLAG_NOCRLF)) {
-      delete[] data_array;
-      ::GlobalUnlock(global_memory_handle);
-      LOG(WARN) << "Unable to encode image stream to base64";
-      return E_FAIL;
-    }
-    data_array[length] = '\0';
-    data = data_array;
-
-    delete[] data_array;
-    ::GlobalUnlock(global_memory_handle);
-
-    return S_OK;
+    return true;
   }
 
-  void GetBrowserChromeDimensions(HWND top_level_window_handle,
-                                  HWND content_window_handle,
-                                  int* width,
-                                  int* height) {
-    LOG(TRACE) << "Entering ScreenshotCommandHandler::GetBrowserChromeDimensions";
-
-    int top_level_window_width = 0;
-    int top_level_window_height = 0;
-    this->GetWindowDimensions(top_level_window_handle,
-                              &top_level_window_width,
-                              &top_level_window_height);
-    LOG(TRACE) << "Top level window dimensions are (w, h): "
-               << top_level_window_width << "," << top_level_window_height;
-
-    int content_window_width = 0;
-    int content_window_height = 0;
-    this->GetWindowDimensions(content_window_handle,
-                              &content_window_width,
-                              &content_window_height);
-    LOG(TRACE) << "Content window dimensions are (w, h): "
-               << content_window_width << "," << content_window_height;
-
-    *width = top_level_window_width - content_window_width;
-    *height = top_level_window_height - content_window_height;
-  }
-
-  void GetWindowDimensions(HWND window_handle, int* width, int* height) {
-    RECT window_rect;
-    ::GetWindowRect(window_handle, &window_rect);
-    *width = window_rect.right - window_rect.left;
-    *height = window_rect.bottom - window_rect.top;
-  }
 };
 
 } // namespace webdriver
